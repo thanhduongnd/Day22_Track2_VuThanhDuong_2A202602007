@@ -8,7 +8,60 @@ Cách dùng:
     chunks      = split_text(text, chunk_size=500, chunk_overlap=50)
     vectorstore = build_vectorstore(chunks, embeddings)
 """
+import re
+import time
 from pathlib import Path
+
+
+_GEMINI_EMBEDDING_BATCH_SIZE = 100
+_MAX_RATE_LIMIT_RETRIES = 3
+
+
+def _get_retry_delay(error: Exception) -> float | None:
+    """Extract Gemini's suggested retry delay from a rate-limit error."""
+    message = str(error)
+    for pattern in (
+        r"retry in\s+(\d+(?:\.\d+)?)s",
+        r"retryDelay.*?(\d+(?:\.\d+)?)s",
+    ):
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _embed_gemini_documents(chunks: list[str], embeddings) -> list[list[float]]:
+    """Embed Gemini documents in quota-sized batches with bounded 429 retries."""
+    vectors = []
+
+    for start in range(0, len(chunks), _GEMINI_EMBEDDING_BATCH_SIZE):
+        batch = chunks[start : start + _GEMINI_EMBEDDING_BATCH_SIZE]
+
+        for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                vectors.extend(embeddings.embed_documents(batch))
+                break
+            except Exception as error:
+                message = str(error)
+                retry_delay = _get_retry_delay(error)
+                is_rate_limited = "429" in message or "RESOURCE_EXHAUSTED" in message
+
+                if (
+                    not is_rate_limited
+                    or retry_delay is None
+                    or attempt == _MAX_RATE_LIMIT_RETRIES
+                ):
+                    raise
+
+                # Add a small buffer so the next request is outside the quota window.
+                wait_seconds = int(retry_delay) + 2
+                print(
+                    f"⏳ Gemini embedding đạt giới hạn quota. "
+                    f"Thử lại sau {wait_seconds} giây ..."
+                )
+                time.sleep(wait_seconds)
+
+    return vectors
 
 
 def load_knowledge_base(path: str = None) -> str:
@@ -64,6 +117,13 @@ def build_vectorstore(chunks: list, embeddings):
     from langchain_community.vectorstores import FAISS
 
     print(f"🔨 Đang tạo FAISS index từ {len(chunks)} chunks ...")
-    vectorstore = FAISS.from_texts(chunks, embeddings)
+
+    is_gemini = embeddings.__class__.__module__.startswith("langchain_google_genai")
+    if is_gemini and len(chunks) > _GEMINI_EMBEDDING_BATCH_SIZE:
+        vectors = _embed_gemini_documents(chunks, embeddings)
+        vectorstore = FAISS.from_embeddings(zip(chunks, vectors), embeddings)
+    else:
+        vectorstore = FAISS.from_texts(chunks, embeddings)
+
     print("✅ FAISS vectorstore đã sẵn sàng.")
     return vectorstore
